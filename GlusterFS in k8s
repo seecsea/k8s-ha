@@ -1,0 +1,212 @@
+8、使用storageclass来试试，通过Heketi实现
+[root@k8s_m2:/etc/yum.repos.d]# yum install epel-release
+[root@k8s_m2:/etc/yum.repos.d]# yum install heketi heketi-client
+[root@k8s_m2:/etc/heketi]# vim heketi.json          端口为了防止冲突，改一个冷门的，比如8695
+    "executor": "ssh",
+
+    "_sshexec_comment": "SSH username and private key file information",
+    "sshexec": {
+      "keyfile": "/var/lib/heketi/id_rsa",
+      "user": "root",
+      "port": "22",
+      "fstab": "/etc/fstab"
+	  
+生成keyfile
+[root@k8s_m2:/etc/heketi]# cp /root/.ssh/id_rsa /var/lib/heketi/id_rsa
+[root@k8s_m2:/etc/heketi]# ssh-copy-id -i /root/.ssh/id_rsa.pub root@10.20.109.190
+[root@k8s_m2:/etc/heketi]# ssh-copy-id -i /root/.ssh/id_rsa.pub root@10.20.109.197
+[root@k8s_m2:/etc/heketi]# ssh-copy-id -i /root/.ssh/id_rsa.pub root@10.20.109.198
+[root@k8s_m2:/etc/heketi]# ssh-copy-id -i /root/.ssh/id_rsa.pub root@10.20.109.199
+启动heketi服务，你会发现在/var/log/messages里很多说无法找到或者读取keyfile的错误，导致服务无法启动。
+其实网上基本没提到的是，heketi在CentOS 7.3上安装后，服务启动的用户是heketi，所以需要改下那个keyfile文件的属性为644，就能启动了。
+systemctl enable heketi
+systemctl start heketi
+验证：
+[root@k8s_m3:~]# curl http://10.20.107.42:8695/hello
+Hello from Heketi[root@k8s_m3:~]# 
+
+添加glusterfs的节点拓扑：
+由于heketi是要管理裸盘的，所以先给4个glusterfs节点再在虚拟机里加上一块新的磁盘，vdc，200G
+修改top配置文件，主要是4个节点和磁盘设备名。当然为了解析域名，也需要修改heketi所在机器的/etc/hosts文件了，不然怎么路由寻路？
+[root@k8s_m2:/etc/heketi]# cat topology.json 
+{
+    "clusters": [
+        {
+            "nodes": [
+                {
+                    "node": {
+                        "hostnames": {
+                            "manage": [
+                                "udocker0.outlu.com"
+                            ],
+                            "storage": [
+                                "10.20.109.190"
+                            ]
+                        },
+                        "zone": 1
+                    },
+                    "devices": [
+                        "/dev/vdc"
+                    ]
+                },
+                {
+                    "node": {
+                        "hostnames": {
+                            "manage": [
+                                "udocker1.outlu.com"
+                            ],
+                            "storage": [
+                                "10.20.109.197"
+                            ]
+                        },
+                        "zone": 1
+                    },
+                    "devices": [
+                        "/dev/vdc"
+                    ]
+                },
+                {
+                    "node": {
+                        "hostnames": {
+                            "manage": [
+                                "udocker2.outlu.com"
+                            ],
+                            "storage": [
+                                "10.20.109.198"
+                            ]
+                        },
+                        "zone": 1
+                    },
+                    "devices": [
+                        "/dev/vdc"
+                    ]
+                },
+                {
+                    "node": {
+                        "hostnames": {
+                            "manage": [
+                                "udocker3.outlu.com"
+                            ],
+                            "storage": [
+                                "10.20.109.199"
+                            ]
+                        },
+                        "zone": 1
+                    },
+                    "devices": [
+                        "/dev/vdc"
+                    ]
+                }
+            ]
+        }
+    ]
+}
+[root@k8s_m2:/etc/heketi]# export HEKETI_CLI_SERVER=http://localhost:8695
+[root@k8s_m2:/etc/heketi]# heketi-cli topology load --json=topology.json     
+Creating cluster ... ID: 264905e07a83a8f3c86ed0dcfb168ca0
+        Creating node udocker0.outlu.com ... ID: f7495aaa668c5247ec597005bc3e3834
+                Adding device /dev/vdc ... OK
+        Creating node udocker1.outlu.com ... ID: 584f7da99f6e7e92ce536bf61fae8d2a
+                Adding device /dev/vdc ... OK
+        Creating node udocker2.outlu.com ... ID: b56050dda0a83601ccef69235f8b11fa
+                Adding device /dev/vdc ... OK
+        Creating node udocker3.outlu.com ... ID: c857e763ba18ce0a738f1a0324dcecdd
+                Adding device /dev/vdc ... OK
+				
+[root@k8s_m2:/etc/heketi]# heketi-cli topology info
+
+Cluster Id: 264905e07a83a8f3c86ed0dcfb168ca0
+[root@k8s_m2:/etc/heketi]# heketi-cli cluster list
+Clusters:
+264905e07a83a8f3c86ed0dcfb168ca0
+[root@k8s_m2:/etc/heketi]# heketi-cli cluster info 264905e07a83a8f3c86ed0dcfb168ca0
+Cluster id: 264905e07a83a8f3c86ed0dcfb168ca0
+Nodes:
+584f7da99f6e7e92ce536bf61fae8d2a
+b56050dda0a83601ccef69235f8b11fa
+c857e763ba18ce0a738f1a0324dcecdd
+f7495aaa668c5247ec597005bc3e3834
+Volumes:
+上面这些Node ID在topology info里有更详细的内容，我这里就没贴那么多了。
+还可以建立一些Volume测试：
+heleti-cli volume create --size=2
+heketi-cli volume list
+heketi-cli volume delete <Id>
+我这里就不一一演示了，应该没啥问题的
+
+现在终于可以开始到k8s里建立StorageClass了
+[root@k8s_m1:/usr/local/src/addons/gluster/class]# cat glusterfs-secret.yaml 
+apiVersion: v1
+kind: Secret
+metadata:
+  name: heketi-secret
+  namespace: default
+data:
+  # base64 encoded password. E.g.: echo -n "adminSec21t" | base64
+  key: YWRtaW5TZWMyMXQ=
+type: kubernetes.io/glusterfs
+[root@k8s_m1:/usr/local/src/addons/gluster/class]# cat glusterfs-storageclass.yaml 
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: glusterfs
+provisioner: kubernetes.io/glusterfs
+parameters:
+  resturl: "http://10.20.107.42:8695"
+  clusterid: "264905e07a83a8f3c86ed0dcfb168ca0"
+  restauthenabled: "true"
+  restuser: "admin"
+  secretNamespace: "default"
+  secretName: "heketi-secret"
+  gidMin: "40000"
+  gidMax: "50000"
+  volumetype: "replicate:2"
+  
+这个卷到底有哪些类型可选？目前还找不到一个完整的列表，比较麻烦：
+https://reviewable.kubernetes.io/reviews/kubernetes/website/3324#-
+https://github.com/heketi/heketi/issues/739
+
+[root@k8s_m1:/usr/local/src/addons/gluster/class]# cat glusterfs-pvc-sc.yaml 
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: glusterfs-sc-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 3Gi
+  storageClassName: glusterfs
+按顺序创建，有可能会出现pvc在pending，describe pvc看到错误：
+Failed to provision volume with StorageClass "glusterfs": glusterfs: create volume err: error creating volume /usr/sbin/thin_check: execvp failed: No such file or directory
+这个和我的GlusterFS安装在Ubuntu 16.04.3上有关，需要安装一个软件：thin-provisioning-tools  （4个GlusterFS上都要安装）
+具体信息请看：https://github.com/heketi/heketi/issues/775
+[root@k8s_m1:/usr/local/src/addons/gluster/class]# cat nginx-deployment.yaml 
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: nginx-gluster-sc
+spec:
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        name: nginx-gluster-sc
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.7.9
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: gluster-nginx-volume-sc
+              mountPath: "/usr/share/nginx/html"
+      volumes:
+      - name: gluster-nginx-volume-sc
+        persistentVolumeClaim:
+          claimName: glusterfs-sc-pvc
+这个部署了就能正常看到整个GlusterFS的动态pv供应是OK的了。中间我把最后一行glusterfs-sc-pvc写错成gluster-sc-pvc导致pod起不来，后来去看所在node上的messages才发现是名字错了
+Error processing volume "gluster-nginx-volume-sc" for pod "nginx-gluster-sc-3294231749-lsx33_default(1d97652a-cfae-11e7-a381-5254000d6f84)": error processing PVC "default"/"gluster-sc-pvc": failed to fetch PVC default/gluster-sc-pvc from API server. err=persistentvolumeclaims "gluster-sc-pvc" not found
